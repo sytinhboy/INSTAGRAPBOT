@@ -24,8 +24,8 @@ InstaGrap là một bot Telegram giúp người dùng tải xuống nội dung t
 
 1. Clone repository:
 ```bash
-git clone https://github.com/sytinhboy/instagrap-bot.git
-cd instagrap-bot
+git clone https://github.com/sytinhboy/INSTAGRAPBOT.git
+cd INSTAGRAPBOT
 ```
 
 2. Cài đặt các gói cần thiết:
