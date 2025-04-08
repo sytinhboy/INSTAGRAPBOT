@@ -14,10 +14,6 @@ import shutil
 import time
 from instagrapi import Client
 from instagrapi.exceptions import LoginRequired
-from dotenv import load_dotenv
-
-# Load environment variables
-load_dotenv()
 
 # Configure logging
 logging.basicConfig(
@@ -26,35 +22,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Bot configuration
-class Config:
-    TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-    INSTAGRAM_USERNAME = os.getenv('INSTAGRAM_USERNAME')
-    INSTAGRAM_PASSWORD = os.getenv('INSTAGRAM_PASSWORD')
-    DOWNLOAD_DIR = "instagram_downloads"
-    
-    @classmethod
-    def validate(cls):
-        missing = []
-        if not cls.TOKEN:
-            missing.append('TELEGRAM_BOT_TOKEN')
-        if not cls.INSTAGRAM_USERNAME:
-            missing.append('INSTAGRAM_USERNAME')
-        if not cls.INSTAGRAM_PASSWORD:
-            missing.append('INSTAGRAM_PASSWORD')
-        
-        if missing:
-            raise ValueError(f"Missing required environment variables: {', '.join(missing)}\n"
-                           f"Please create a .env file with the following variables:\n"
-                           f"TELEGRAM_BOT_TOKEN=your_token\n"
-                           f"INSTAGRAM_USERNAME=your_username\n"
-                           f"INSTAGRAM_PASSWORD=your_password")
+# Bot token from BotFather
+TOKEN = "7652049641:AAEu4SaqF2g0K_GfT_MXu9udRVlg6iSzrWQ"
 
 # Instagram URL pattern
 INSTAGRAM_URL_PATTERN = r'https?://(?:www\.)?instagram\.com/(?:p|reel|stories|s)/([^/?]+)(?:/([^/?]+))?'
 
+# Thêm thông tin đăng nhập Instagram
+INSTAGRAM_USERNAME = "lamnhiactiveauth"
+INSTAGRAM_PASSWORD = "trong123"
+
 # Thư mục lưu trữ
-DOWNLOAD_DIR = Config.DOWNLOAD_DIR
+DOWNLOAD_DIR = "instagram_downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 # Instagram client
@@ -62,101 +41,27 @@ cl = Client()
 cl.delay_range = [1, 3]  # Delay giữa các request
 
 def init_instagram_client():
-    """Initialize Instagram client with login and session management."""
+    """Initialize Instagram client with login"""
     try:
-        Config.validate()
+        # Try to load session from file
         session_file = "instagram_session.json"
-        
-        # Thử load session cũ trước
         if os.path.exists(session_file):
             try:
                 cl.load_settings(session_file)
-                cl.get_timeline_feed()  # Kiểm tra session còn hiệu lực
-                logger.info("✅ Đã load session cũ thành công")
+                cl.get_timeline_feed()  # Test if session is valid
+                logger.info("Loaded existing Instagram session")
                 return True
-            except Exception as e:
-                logger.warning(f"⚠️ Session cũ không hợp lệ: {e}")
-                try:
-                    os.remove(session_file)
-                except:
-                    pass
-
-        # Nếu không có session hoặc session hết hạn, đăng nhập lại
-        try:
-            cl.set_settings({
-                "device_settings": {
-                    "app_version": "269.0.0.18.75",
-                    "android_version": 26,
-                    "android_release": "8.0.0",
-                    "dpi": "480dpi",
-                    "resolution": "1080x1920",
-                    "manufacturer": "OnePlus",
-                    "device": "6T",
-                    "model": "ONEPLUS A6013",
-                    "cpu": "qcom",
-                    "version_code": "314665256"
-                },
-                "user_agent": "Instagram 269.0.0.18.75 Android (26/8.0.0; 480dpi; 1080x1920; OnePlus; 6T; OnePlus6T; qcom; en_US; 314665256)"
-            })
-
-            # Đăng nhập với device ID cố định
-            cl.set_device({
-                "app_version": "269.0.0.18.75",
-                "android_version": 26,
-                "android_release": "8.0.0",
-                "dpi": "480dpi",
-                "resolution": "1080x1920",
-                "manufacturer": "OnePlus",
-                "device": "6T",
-                "model": "ONEPLUS A6013",
-                "cpu": "qcom",
-                "version_code": "314665256"
-            })
-
-            # Thực hiện đăng nhập
-            login_response = cl.login(
-                username=Config.INSTAGRAM_USERNAME,
-                password=Config.INSTAGRAM_PASSWORD,
-                relogin=True
-            )
-
-            if login_response:
-                # Lưu session mới
-                cl.dump_settings(session_file)
-                logger.info("✅ Đăng nhập và lưu session mới thành công")
-                return True
-            else:
-                logger.error("❌ Đăng nhập thất bại")
-                return False
-
-        except Exception as e:
-            if "challenge_required" in str(e):
-                try:
-                    logger.info("🔐 Yêu cầu xác minh bảo mật...")
-                    
-                    # Chọn phương thức xác minh (0: SMS, 1: Email)
-                    choice = cl.challenge_resolve_choice()
-                    if choice:
-                        logger.info("✅ Đã chọn phương thức xác minh")
-                    
-                    # Nhập mã xác minh
-                    code = input("📱 Nhập mã xác minh từ SMS/Email: ")
-                    cl.challenge_resolve(code)
-                    
-                    # Lưu session sau khi xác minh
-                    cl.dump_settings(session_file)
-                    logger.info("✅ Xác minh và lưu session thành công")
-                    return True
-                    
-                except Exception as challenge_error:
-                    logger.error(f"❌ Lỗi xác minh: {challenge_error}")
-                    return False
-            else:
-                logger.error(f"❌ Lỗi đăng nhập: {e}")
-                return False
-                
+            except Exception:
+                logger.warning("Existing session invalid, creating new login")
+        
+        # Login with username and password
+        cl.login(INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
+        # Save session for future use
+        cl.dump_settings(session_file)
+        logger.info("Created new Instagram session")
+        return True
     except Exception as e:
-        logger.error(f"❌ Lỗi khởi tạo client: {e}")
+        logger.error(f"Failed to initialize Instagram client: {e}")
         return False
 
 async def download_instagram_content(shortcode: str) -> list:
@@ -829,7 +734,7 @@ async def main() -> None:
         return
     
     # Create the Application
-    application = Application.builder().token(Config.TOKEN).build()
+    application = Application.builder().token(TOKEN).build()
 
     # Add handlers
     application.add_handler(CommandHandler("start", start))
