@@ -29,8 +29,8 @@ TOKEN = "7652049641:AAEu4SaqF2g0K_GfT_MXu9udRVlg6iSzrWQ"
 INSTAGRAM_URL_PATTERN = r'https?://(?:www\.)?instagram\.com/(?:p|reel|stories|s)/([^/?]+)(?:/([^/?]+))?'
 
 # Thêm thông tin đăng nhập Instagram
-INSTAGRAM_USERNAME = "lamnhiactiveauth"
-INSTAGRAM_PASSWORD = "trong123"
+INSTAGRAM_USERNAME = "Your-Username"
+INSTAGRAM_PASSWORD = "Your-Password"
 
 # Thư mục lưu trữ
 DOWNLOAD_DIR = "instagram_downloads"
