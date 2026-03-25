@@ -13,8 +13,16 @@ import glob
 import shutil
 import time
 from instagrapi import Client
-from instagrapi.exceptions import LoginRequired
+from instagrapi import config as ig_config
+from instagrapi.exceptions import (
+    ClientJSONDecodeError,
+    ClientNotFoundError,
+    LoginRequired,
+    MediaNotFound,
+)
 from dotenv import load_dotenv
+import random
+import time 
 
 # Load environment variables
 load_dotenv()
@@ -57,12 +65,119 @@ INSTAGRAM_URL_PATTERN = r'https?://(?:www\.)?instagram\.com/(?:p|reel|stories|s)
 DOWNLOAD_DIR = Config.DOWNLOAD_DIR
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-# Instagram client
-cl = Client()
-cl.delay_range = [1, 3]  # Delay giữa các request
+
+class InstagramBotClient(Client):
+    """
+    Bỏ qua login_flow() mặc định (reels_tray + timeline) — Instagram thường trả 400
+    và body rỗng trên challenge/, gây JSONDecodeError dù login 200 OK.
+    """
+
+    def login_flow(self) -> bool:
+        return True
+
+
+# Instagram client (timeout mặc định 1s của instagrapi dễ body không đủ → JSON lỗi)
+cl = InstagramBotClient(request_timeout=30)
+cl.delay_range = [2, 5]  # Delay giữa các request
+
+
+def _is_json_parse_error(error: Exception) -> bool:
+    """Detect empty/invalid JSON responses from Instagram API."""
+    if isinstance(error, (json.JSONDecodeError, ClientJSONDecodeError)):
+        return True
+    message = str(error).lower()
+    return "expecting value: line 1 column 1" in message or "jsondecodeerror" in message
+
+
+async def fetch_media_info_resilient(media_pk: str, shortcode: str | None = None):
+    """
+    Instagram thường trả body rỗng; instagrapi bọc lỗi trong ClientJSONDecodeError.
+    Thử lần lượt nhiều nguồn (v1, web a1, GQL có session, media_info kết hợp) + backoff.
+    """
+    pk = cl.media_pk(media_pk)
+    delays = [1, 2, 4, 8]
+    last_err = None
+
+    def _strategies():
+        if cl.user_id:
+            yield "media_info_v1", lambda: cl.media_info_v1(pk)
+        yield "media_info_a1", lambda: cl.media_info_a1(pk)
+        if cl.user_id:
+
+            def _gql_with_session():
+                cl.inject_sessionid_to_public()
+                return cl.media_info_gql(pk)
+
+            yield "media_info_gql", _gql_with_session
+        yield "media_info", lambda: cl.media_info(pk, use_cache=False)
+
+    for round_i, delay in enumerate(delays):
+        cl.inject_sessionid_to_public()
+        for name, fn in _strategies():
+            try:
+                media = fn()
+                if round_i:
+                    logger.info(f"Đã lấy media_info qua {name} sau {round_i} vòng retry")
+                return media
+            except (MediaNotFound, ClientNotFoundError):
+                raise
+            except Exception as e:
+                last_err = e
+                logger.debug(f"{name} thất bại: {e}")
+                try:
+                    cl._medias_cache.pop(pk, None)
+                except Exception:
+                    pass
+                continue
+        if round_i < len(delays) - 1 and last_err is not None and _is_json_parse_error(last_err):
+            logger.warning(
+                f"Mọi nguồn media_info đều lỗi JSON (vòng {round_i + 1}/{len(delays)}), chờ {delay}s..."
+            )
+            await asyncio.sleep(delay)
+            continue
+        break
+
+    if last_err is not None:
+        raise last_err
+    raise RuntimeError(f"Không lấy được media_info cho pk={pk} shortcode={shortcode!r}")
+
+
+def _latest_instagrapi_app_version() -> str:
+    """Phiên bản app Android mới nhất khai báo trong instagrapi (Meta chặn bản API quá cũ)."""
+    return max(
+        ig_config.APP_SETTINGS.keys(),
+        key=lambda s: tuple(int(p) for p in s.split(".")),
+    )
+
+
+def sync_instagrapi_fingerprint(client: Client, reset_device: bool = False) -> None:
+    """
+    Căn chỉnh app_version / version_code / bloks_versioning_id / user_agent theo bản instagrapi.
+    Session JSON cũ thường kèm fingerprint 269.x — dễ bị 400 + challenge; cần nâng lên bản hiện tại.
+    """
+    if reset_device:
+        client.set_device({})
+    client.set_app(_latest_instagrapi_app_version())
+    client.set_user_agent()
+    client.init()
+
+
+def _best_photo_url(media_info) -> str | None:
+    """Chọn URL ảnh có width lớn nhất nếu có; không gọi lại media_info (tránh GQL body rỗng)."""
+    iv2 = getattr(media_info, "image_versions2", None)
+    candidates = getattr(iv2, "candidates", None) if iv2 else None
+    if candidates:
+        best = max(candidates, key=lambda c: getattr(c, "width", 0) or 0)
+        u = getattr(best, "url", None)
+        if u:
+            return str(u)
+    thumb = getattr(media_info, "thumbnail_url", None)
+    return str(thumb) if thumb else None
+
 
 def init_instagram_client():
     """Initialize Instagram client with login and session management."""
+    global cl
     try:
         Config.validate()
         session_file = "instagram_session.json"
@@ -70,9 +185,13 @@ def init_instagram_client():
         # Thử load session cũ trước
         if os.path.exists(session_file):
             try:
-                cl.load_settings(session_file)
-                cl.get_timeline_feed()  # Kiểm tra session còn hiệu lực
+                cl.load_settings(session_file, override_app_version=True)
+                sync_instagrapi_fingerprint(cl, reset_device=False)
+                cl.account_info()  # Nhẹ hơn timeline/reels, tránh cold-start 400
                 logger.info("✅ Đã load session cũ thành công")
+                
+                # Thêm delay để tránh rate limit
+                time.sleep(2)
                 return True
             except Exception as e:
                 logger.warning(f"⚠️ Session cũ không hợp lệ: {e}")
@@ -80,39 +199,24 @@ def init_instagram_client():
                     os.remove(session_file)
                 except:
                     pass
+                if _is_json_parse_error(e):
+                    # Reset client state if previous session check got invalid JSON response
+                    cl = InstagramBotClient(request_timeout=30)
+                    cl.delay_range = [2, 5]
 
         # Nếu không có session hoặc session hết hạn, đăng nhập lại
         try:
-            cl.set_settings({
-                "device_settings": {
-                    "app_version": "269.0.0.18.75",
-                    "android_version": 26,
-                    "android_release": "8.0.0",
-                    "dpi": "480dpi",
-                    "resolution": "1080x1920",
-                    "manufacturer": "OnePlus",
-                    "device": "6T",
-                    "model": "ONEPLUS A6013",
-                    "cpu": "qcom",
-                    "version_code": "314665256"
-                },
-                "user_agent": "Instagram 269.0.0.18.75 Android (26/8.0.0; 480dpi; 1080x1920; OnePlus; 6T; OnePlus6T; qcom; en_US; 314665256)"
-            })
+            # Không hard-code Instagram 269.x — dùng DEVICE_SETTINGS + APP_SETTINGS của instagrapi đã cài
+            sync_instagrapi_fingerprint(cl, reset_device=True)
+            cl.delay_range = [2, 5]
+            logger.info(
+                "📱 Đang dùng fingerprint instagrapi: app %s",
+                _latest_instagrapi_app_version(),
+            )
 
-            # Đăng nhập với device ID cố định
-            cl.set_device({
-                "app_version": "269.0.0.18.75",
-                "android_version": 26,
-                "android_release": "8.0.0",
-                "dpi": "480dpi",
-                "resolution": "1080x1920",
-                "manufacturer": "OnePlus",
-                "device": "6T",
-                "model": "ONEPLUS A6013",
-                "cpu": "qcom",
-                "version_code": "314665256"
-            })
-
+            # Thêm delay trước khi đăng nhập
+            time.sleep(3)
+            
             # Thực hiện đăng nhập
             login_response = cl.login(
                 username=Config.INSTAGRAM_USERNAME,
@@ -124,12 +228,43 @@ def init_instagram_client():
                 # Lưu session mới
                 cl.dump_settings(session_file)
                 logger.info("✅ Đăng nhập và lưu session mới thành công")
+                
+                # Thêm delay sau khi đăng nhập
+                time.sleep(2)
                 return True
             else:
                 logger.error("❌ Đăng nhập thất bại")
                 return False
 
         except Exception as e:
+            if _is_json_parse_error(e):
+                logger.warning("⚠️ Instagram trả về dữ liệu không hợp lệ, thử đăng nhập lại...")
+                try:
+                    if os.path.exists(session_file):
+                        os.remove(session_file)
+                except Exception:
+                    pass
+
+                # Re-create a clean client state and retry once
+                cl = InstagramBotClient(request_timeout=30)
+                cl.delay_range = [2, 5]
+                try:
+                    sync_instagrapi_fingerprint(cl, reset_device=True)
+                    cl.delay_range = [2, 5]
+                    time.sleep(3)
+                    login_response = cl.login(
+                        username=Config.INSTAGRAM_USERNAME,
+                        password=Config.INSTAGRAM_PASSWORD,
+                        relogin=True
+                    )
+                    if login_response:
+                        cl.dump_settings(session_file)
+                        logger.info("✅ Đăng nhập lại thành công sau khi reset client")
+                        time.sleep(2)
+                        return True
+                except Exception as retry_error:
+                    logger.error(f"❌ Đăng nhập lại thất bại: {retry_error}")
+                return False
             if "challenge_required" in str(e):
                 try:
                     logger.info("🔐 Yêu cầu xác minh bảo mật...")
@@ -151,6 +286,10 @@ def init_instagram_client():
                 except Exception as challenge_error:
                     logger.error(f"❌ Lỗi xác minh: {challenge_error}")
                     return False
+            elif "Please wait a few minutes before you try again" in str(e):
+                logger.warning("⚠️ Đã bị rate limit, đợi 15 phút và thử lại sau")
+                time.sleep(900)  # Đợi 15 phút
+                return init_instagram_client()  # Thử lại sau khi đợi
             else:
                 logger.error(f"❌ Lỗi đăng nhập: {e}")
                 return False
@@ -163,11 +302,27 @@ async def download_instagram_content(shortcode: str) -> list:
     """Download Instagram content using instagrapi"""
     media_files = []
     try:
+        # Thêm delay ngẫu nhiên trước khi bắt đầu request để tránh rate limit
+        delay = random.uniform(3, 7)
+        await asyncio.sleep(delay)
+        
         # Get media ID from shortcode
         media_pk = cl.media_pk_from_code(shortcode)
         
+        # Thêm delay giữa các request
+        await asyncio.sleep(2)
+        
         # Get media info
-        media_info = cl.media_info(media_pk)
+        try:
+            media_info = await fetch_media_info_resilient(media_pk, shortcode)
+        except Exception as e:
+            if "Please wait a few minutes before you try again" in str(e):
+                logger.warning("⚠️ Rate limit khi lấy media info, đợi 15 phút và thử lại")
+                await asyncio.sleep(200)  # Đợi 3 phút
+                return await download_instagram_content(shortcode)
+            else:
+                raise e
+                
         username = media_info.user.username
         
         # Lấy caption và loại bỏ hashtag
@@ -196,18 +351,36 @@ async def download_instagram_content(shortcode: str) -> list:
         os.makedirs(target_dir, exist_ok=True)
         
         if media_info.media_type == 1:  # Photo
-            # Download photo
-            photo_path = cl.photo_download(media_pk, target_dir)
-            photo_path_str = str(photo_path)
-            media_files.append({
-                "path": photo_path_str, 
-                "type": "image",
-                "username": username,  # Thêm username vào media_files
-                "media_info": media_info  # Thêm toàn bộ media_info
-            })
+            try:
+                # Thêm delay trước khi download
+                await asyncio.sleep(2)
+                
+                # Không dùng photo_download(): bên trong gọi media_info() → GQL dễ JSON lỗi
+                photo_url = _best_photo_url(media_info)
+                if not photo_url:
+                    raise RuntimeError("Không có URL ảnh trong media_info")
+                fname = "{0}_{1}".format(username, media_pk)
+                photo_path = cl.photo_download_by_url(photo_url, fname, target_dir)
+                photo_path_str = str(photo_path)
+                media_files.append({
+                    "path": photo_path_str, 
+                    "type": "image",
+                    "username": username,  # Thêm username vào media_files
+                    "media_info": media_info  # Thêm toàn bộ media_info
+                })
+            except Exception as e:
+                if "Please wait a few minutes before you try again" in str(e):
+                    logger.warning("⚠️ Rate limit khi tải ảnh, đợi 15 phút và thử lại")
+                    await asyncio.sleep(200)  # Đợi 3 phút
+                    return await download_instagram_content(shortcode)
+                else:
+                    raise e
             
         elif media_info.media_type == 2:  # Video
             try:
+                # Thêm delay trước khi xử lý video
+                await asyncio.sleep(3)
+                
                 # Lấy URL video chất lượng cao nhất từ resources
                 video_url = None
                 max_width = 0
@@ -235,33 +408,44 @@ async def download_instagram_content(shortcode: str) -> list:
                     file_name = f"{shortcode}.mp4"
                     file_path = os.path.join(target_dir, file_name)
                     
-                    # Tăng timeout cho video dài
-                    response = requests.get(video_url, stream=True, timeout=30)
-                    if response.status_code == 200:
-                        with open(file_path, 'wb') as f:
-                            for chunk in response.iter_content(chunk_size=8192):
-                                if chunk:
-                                    f.write(chunk)
-                        media_files.append({
-                            "path": file_path, 
-                            "type": "video",
-                            "username": username,
-                            "media_info": media_info,
-                            "quality": f"{max_width}p"  # Thêm thông tin độ phân giải
-                        })
-                        logger.info(f"Đã tải video chất lượng cao {max_width}p: {file_path}")
-                    else:
-                        raise Exception(f"Không thể tải video (HTTP {response.status_code})")
+                    # Sử dụng aiohttp để tải video bất đồng bộ
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(video_url, timeout=60) as response:
+                            if response.status == 200:
+                                with open(file_path, 'wb') as f:
+                                    f.write(await response.read())
+                                media_files.append({
+                                    "path": file_path, 
+                                    "type": "video",
+                                    "username": username,
+                                    "media_info": media_info,
+                                    "quality": f"{max_width}p"  # Thêm thông tin độ phân giải
+                                })
+                                logger.info(f"Đã tải video chất lượng cao {max_width}p: {file_path}")
+                            else:
+                                raise Exception(f"Không thể tải video (HTTP {response.status})")
                 else:
                     raise Exception("Không tìm thấy URL video chất lượng cao")
                     
             except Exception as e:
+                if "Please wait a few minutes before you try again" in str(e):
+                    logger.warning("⚠️ Rate limit khi tải video, đợi 15 phút và thử lại")
+                    await asyncio.sleep(200)  # Đợi 3 phút
+                    return await download_instagram_content(shortcode)
+                
                 logger.error(f"Lỗi khi tải video chất lượng cao: {e}")
                 # Fallback: sử dụng phương thức tải thông thường
                 try:
-                    video_path = cl.video_download(media_pk, target_dir)
+                    await asyncio.sleep(3)  # Thêm delay trước khi thử lại
+                    if not media_info.video_url:
+                        raise RuntimeError("Không có video_url trong media_info")
+                    video_path = cl.video_download_by_url(
+                        str(media_info.video_url),
+                        "{0}_{1}".format(username, media_pk),
+                        target_dir,
+                    )
                     if video_path and os.path.exists(str(video_path)):
-                        new_path = os.path.join(target_dir, file_name)
+                        new_path = os.path.join(target_dir, f"{shortcode}.mp4")
                         os.rename(str(video_path), new_path)
                         media_files.append({
                             "path": new_path,
@@ -269,42 +453,84 @@ async def download_instagram_content(shortcode: str) -> list:
                             "username": username,
                             "media_info": media_info
                         })
-                        logger.info(f"Đã tải story dự phòng: {file_name}")
+                        logger.info(f"Đã tải video dự phòng: {new_path}")
                 except Exception as backup_error:
-                    logger.error(f"Lỗi khi tải story dự phòng {file_name}: {backup_error}")
+                    if "Please wait a few minutes before you try again" in str(backup_error):
+                        logger.warning("⚠️ Rate limit khi tải video dự phòng, đợi 15 phút và thử lại")
+                        await asyncio.sleep(200)  # Đợi 3 phút
+                        return await download_instagram_content(shortcode)
+                    logger.error(f"Lỗi khi tải video dự phòng: {backup_error}")
             
         elif media_info.media_type == 8:  # Album
-            # Download all items in album
-            album_files = cl.album_download(media_pk, target_dir)
-            for file_path in album_files:
-                file_path_str = str(file_path)
-                if file_path_str.endswith('.mp4'):
-                    # Thử tải lại video với chất lượng cao
-                    try:
-                        video_url = cl.media_info(media_pk).video_url
-                        if video_url:
-                            response = requests.get(video_url, stream=True)
-                            if response.status_code == 200:
-                                with open(file_path_str, 'wb') as f:
-                                    for chunk in response.iter_content(chunk_size=8192):
-                                        if chunk:
-                                            f.write(chunk)
-                                logger.info(f"Đã tải lại video album với chất lượng cao: {file_path_str}")
-                    except Exception as e:
-                        logger.error(f"Không thể tải lại video album chất lượng cao: {e}")
-                    media_files.append({
-                        "path": file_path_str, 
-                        "type": "video",
-                        "username": username,  # Thêm username vào media_files
-                        "media_info": media_info  # Thêm toàn bộ media_info
-                    })
+            try:
+                # Thêm delay trước khi download album
+                await asyncio.sleep(3)
+                
+                # Không dùng album_download(): bên trong gọi media_info() lại
+                album_files = []
+                for resource in media_info.resources:
+                    fn = f"{media_info.user.username}_{resource.pk}"
+                    if resource.media_type == 1:
+                        album_files.append(
+                            cl.photo_download_by_url(
+                                str(resource.thumbnail_url), fn, target_dir
+                            )
+                        )
+                    elif resource.media_type == 2:
+                        album_files.append(
+                            cl.video_download_by_url(
+                                str(resource.video_url), fn, target_dir
+                            )
+                        )
+                    else:
+                        raise RuntimeError(
+                            f"Kiểu media album không hỗ trợ: {resource.media_type}"
+                        )
+                
+                # Thêm delay giữa các file trong album
+                await asyncio.sleep(2)
+                
+                for file_path in album_files:
+                    file_path_str = str(file_path)
+                    if file_path_str.endswith('.mp4'):
+                        # Thử tải lại video với chất lượng cao
+                        try:
+                            video_url = media_info.video_url
+                            if video_url:
+                                # Sử dụng aiohttp để tải video bất đồng bộ
+                                async with aiohttp.ClientSession() as session:
+                                    async with session.get(video_url, timeout=60) as response:
+                                        if response.status == 200:
+                                            with open(file_path_str, 'wb') as f:
+                                                f.write(await response.read())
+                                            logger.info(f"Đã tải lại video album với chất lượng cao: {file_path_str}")
+                        except Exception as e:
+                            if "Please wait a few minutes before you try again" in str(e):
+                                # Không cần thử lại cả album, chỉ ghi log
+                                logger.warning(f"⚠️ Rate limit khi tải lại video album, bỏ qua: {file_path_str}")
+                            else:
+                                logger.error(f"Không thể tải lại video album chất lượng cao: {e}")
+                        
+                        media_files.append({
+                            "path": file_path_str, 
+                            "type": "video",
+                            "username": username,
+                            "media_info": media_info
+                        })
+                    else:
+                        media_files.append({
+                            "path": file_path_str, 
+                            "type": "image",
+                            "username": username,
+                            "media_info": media_info
+                        })
+            except Exception as e:
+                if "Please wait a few minutes before you try again" in str(e):
+                    logger.warning("⚠️ Rate limit khi tải album, đợi 15 phút và thử lại")
+                    await asyncio.sleep(200)  # Đợi 3 phút
+                    return await download_instagram_content(shortcode)
                 else:
-                    media_files.append({
-                        "path": file_path_str, 
-                        "type": "image",
-                        "username": username,  # Thêm username vào media_files
-                        "media_info": media_info  # Thêm toàn bộ media_info
-                    })
+                    raise e
         
         logger.info(f"Downloaded {len(media_files)} files from {shortcode}")
         
@@ -327,10 +553,17 @@ async def download_instagram_content(shortcode: str) -> list:
     except LoginRequired:
         logger.error("Login required, trying to re-login")
         if init_instagram_client():
+            # Thêm delay trước khi thử lại
+            await asyncio.sleep(5)
             # Retry once after re-login
             return await download_instagram_content(shortcode)
         return []
     except Exception as e:
+        if "Please wait a few minutes before you try again" in str(e):
+            logger.warning("⚠️ Rate limit ở cấp độ function, đợi 15 phút và thử lại")
+            await asyncio.sleep(200)  # Đợi 3 phút
+            return await download_instagram_content(shortcode)
+            
         logger.error(f"Error downloading content: {e}")
         return []
 
@@ -489,18 +722,7 @@ async def process_instagram_url(update: Update, context: CallbackContext) -> Non
         else:
             # URL là post hoặc reel bình thường
             shortcode = first_part
-            await processing_message.edit_text("🔍 Đang kiểm tra nội dung...")
-            
-            # Lấy thông tin username trước
-            try:
-                media_pk = cl.media_pk_from_code(shortcode)
-                media_info = cl.media_info(media_pk)
-                username = media_info.user.username
-                await processing_message.edit_text(f"📥 Đang tải nội dung của @{username}...")
-            except Exception as e:
-                logger.error(f"Lỗi khi lấy thông tin username: {e}")
-                await processing_message.edit_text("📥 Đang tải nội dung...")
-            
+            await processing_message.edit_text("📥 Đang tải nội dung...")
             media_items = await download_instagram_content(shortcode)
         
         if not media_items:
@@ -691,9 +913,10 @@ async def process_instagram_url(update: Update, context: CallbackContext) -> Non
 async def start(update: Update, context: CallbackContext) -> None:
     """Send a message when the command /start is issued."""
     await update.message.reply_text(
-        "👋 Chào mừng đến với Bot Tải xuống Instagram!\n\n"
-        "Gửi cho tôi URL bài đăng, video ngắn Instagram, và tôi sẽ tải xuống cho bạn.\n\n"
-        "Ví dụ: https://www.instagram.com/p/XXXX/"
+        "👋 Chào mừng đến với Bot Tải Video & Ảnh Instagram!\n\n"
+        "Gửi cho tôi URL bài đăng, video ngắn Instagram, và tôi sẽ tải xuống cho bạn.\n\n" 
+        "Ví dụ: https://www.instagram.com/p/XXXX/\n\n" 
+        "Lưu ý: Bot hỗ trợ tải các định dạng sau: Post, Reel, Story\n\n"
     )
 
 async def help_command(update: Update, context: CallbackContext, return_text: bool = False) -> None:
